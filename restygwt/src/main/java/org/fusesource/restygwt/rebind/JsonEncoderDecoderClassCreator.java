@@ -807,6 +807,26 @@ public class JsonEncoderDecoderClassCreator extends BaseSourceCreator {
     }
 
     /**
+     * Recursively search for field in class heirarchy.
+     *
+     * @param type
+     * @param fieldName
+     * @return
+     */
+    private JField getFieldFromHierarchy(JClassType type, String fieldName) {
+        JClassType superType = type;
+        JField result = null;
+        while (superType != null) {
+            result = superType.getField(fieldName);
+            if (result != null) {
+                break;
+            }
+            superType = superType.getSuperclass();
+        }
+        return result;
+    }
+
+    /**
      * Inspects the supplied type and all super classes up to but excluding
      * Object and returns a list of all fields found in these classes.
      *
@@ -817,55 +837,63 @@ public class JsonEncoderDecoderClassCreator extends BaseSourceCreator {
         List<JField> allFields = getFields(new ArrayList<JField>(), type);
         Map<String, JMethod> getters = new HashMap<String, JMethod>();
         Map<String, JType> setters = new HashMap<String, JType>();
-        for( JMethod m: type.getInheritableMethods() ){
-            if( m.getName().startsWith("set") &&
-                    m.getParameterTypes().length == 1 &&
-                    m.getReturnType() == JPrimitiveType.VOID &&
-					getAnnotation(m, JsonIgnore.class) == null && 
-					getAnnotation(m, XmlTransient.class) == null) {
-                setters.put( m.getName().replaceFirst("^set", ""), m.getParameterTypes()[0] );
+        for( JMethod method: type.getInheritableMethods() ){
+            if( method.getName().startsWith("set") ) {
+                if (method.getParameterTypes().length == 1 &&
+                        method.getReturnType() == JPrimitiveType.VOID &&
+					    getAnnotation(method, JsonIgnore.class) == null &&
+					    getAnnotation(method, XmlTransient.class) == null &&
+                        method.getName().length() > "set".length()) {
+                    setters.put( method.getName().replaceFirst("^set", ""), method.getParameterTypes()[0] );
+                }
             }
-            else if( m.getName().startsWith("get") &&
-                    m.getParameterTypes().length == 0 &&
-                    m.getReturnType() != JPrimitiveType.VOID &&
-					getAnnotation(m, JsonIgnore.class) == null && 
-					getAnnotation(m, XmlTransient.class) == null) {
-                getters.put( m.getName().replaceFirst("^get", ""), m );
+            else if( method.getName().startsWith("get") ) {
+                if (method.getParameterTypes().length == 0 &&
+                        method.getReturnType() != JPrimitiveType.VOID &&
+					    getAnnotation(method, JsonIgnore.class) == null &&
+					    getAnnotation(method, XmlTransient.class) == null &&
+                        method.getName().length() > "get".length()) {
+                    getters.put( method.getName().replaceFirst("^get", ""), method );
+                }
             }
         }
         for( Map.Entry<String, JMethod> entry: getters.entrySet() ){
-            if ( setters.containsKey( entry.getKey() ) && setters.get( entry.getKey() ).equals( entry.getValue().getReturnType() ) ) {
-                String name = entry.getKey().substring(0, 1).toLowerCase() + entry.getKey().substring(1);
-                boolean found = false;
-                for( JField f : allFields ){
-                    if( f.getName().equals( name ) ){
-                        found = true;
+            String propertyNameKey = entry.getKey();
+            JMethod getterMethod = entry.getValue();
+
+            if ( setters.containsKey( propertyNameKey ) && setters.get( propertyNameKey ).equals( getterMethod.getReturnType() ) ) {
+                String jsonPropertyName = propertyNameKey.substring(0, 1).toLowerCase() + propertyNameKey.substring(1);
+                boolean foundMatchingEligibleField = false;
+                for( JField field : allFields ){
+                    if( field.getName().equals( jsonPropertyName ) ){
+                        foundMatchingEligibleField = true;
                         break;
                     }
                 }
-                JField f = type.findField( name );
+                JField matchingField = getFieldFromHierarchy( type, jsonPropertyName );
                 // is getter annotated, if yes use this annotation for the field
-                JsonProperty propName = null;
-                if ( entry.getValue().isAnnotationPresent(JsonProperty.class) ) {
-                    propName = getAnnotation(entry.getValue(), JsonProperty.class);
+                JsonProperty getterOrSetterJsonPropertyAnnotation = null;
+                if ( getterMethod.isAnnotationPresent(JsonProperty.class) ) {
+                    getterOrSetterJsonPropertyAnnotation = getAnnotation(getterMethod, JsonProperty.class);
                 }
                 // is setter annotated, if yes use this annotation for the field
-                JMethod m = type.findMethod("s" + entry.getValue().getName().substring(1),
-                        new JType[]{ entry.getValue().getReturnType() });
-                if ( m != null && m.isAnnotationPresent(JsonProperty.class) ) {
-                    propName = getAnnotation(m, JsonProperty.class);
+                JMethod setterMethod = type.findMethod("s" + getterMethod.getName().substring(1),
+                        new JType[]{ getterMethod.getReturnType() });
+                if ( setterMethod != null && setterMethod.isAnnotationPresent(JsonProperty.class) ) {
+                    getterOrSetterJsonPropertyAnnotation = getAnnotation(setterMethod, JsonProperty.class);
                 }
-                // if have a field and an annotation from the getter/setter then use that annotation 
-                if ( propName != null && found && !f.getName().equals(propName.value())) {
-                    allFields.remove(f);
-                    DummyJField dummy = new DummyJField( name, entry.getValue().getReturnType() );
-                    dummy.setAnnotation( propName );
+                // if have a field and an annotation from the getter/setter then use that annotation
+                if ( getterOrSetterJsonPropertyAnnotation != null && foundMatchingEligibleField && !matchingField.getName().equals(getterOrSetterJsonPropertyAnnotation.value())) {
+                    allFields.remove(matchingField);
+                    DummyJField dummy = new DummyJField( jsonPropertyName, getterMethod.getReturnType() );
+                    dummy.setAnnotation( getterOrSetterJsonPropertyAnnotation );
                     allFields.add(dummy);
                 }
-                if ( ! found && !( f != null && f.isAnnotationPresent( JsonIgnore.class ) ) ){
-                    DummyJField dummy = new DummyJField( name, entry.getValue().getReturnType() );
-                    if ( entry.getValue().isAnnotationPresent(JsonProperty.class) ) {
-                        dummy.setAnnotation( getAnnotation(entry.getValue(), JsonProperty.class) );
+                if ( !foundMatchingEligibleField && ( matchingField == null ||
+                        ( !matchingField.isAnnotationPresent( JsonIgnore.class ) && !matchingField.isAnnotationPresent( XmlTransient.class ) ) ) ){
+                    DummyJField dummy = new DummyJField( jsonPropertyName, getterMethod.getReturnType() );
+                    if ( getterMethod.isAnnotationPresent(JsonProperty.class) ) {
+                        dummy.setAnnotation( getAnnotation(getterMethod, JsonProperty.class) );
                     }
                     allFields.add( dummy );
                 }
